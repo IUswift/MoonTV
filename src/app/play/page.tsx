@@ -14,14 +14,11 @@ import {
   getAllPlayRecords,
   isFavorited,
   savePlayRecord,
+  subscribeToDataUpdates,
   toggleFavorite,
 } from '@/lib/db.client';
-import {
-  type VideoDetail,
-  fetchVideoDetail,
-} from '@/lib/fetchVideoDetail.client';
 import { SearchResult } from '@/lib/types';
-import { getVideoResolutionFromM3u8 } from '@/lib/utils';
+import { getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
 
 import EpisodeSelector from '@/components/EpisodeSelector';
 import PageLayout from '@/components/PageLayout';
@@ -46,7 +43,7 @@ function PlayPageClient() {
   >('searching');
   const [loadingMessage, setLoadingMessage] = useState('正在搜索播放源...');
   const [error, setError] = useState<string | null>(null);
-  const [detail, setDetail] = useState<VideoDetail | null>(null);
+  const [detail, setDetail] = useState<SearchResult | null>(null);
 
   // 收藏状态
   const [favorited, setFavorited] = useState(false);
@@ -74,6 +71,10 @@ function PlayPageClient() {
   );
   const [currentId, setCurrentId] = useState(searchParams.get('id') || '');
 
+  // 搜索所需信息
+  const [searchTitle] = useState(searchParams.get('stitle') || '');
+  const [searchType] = useState(searchParams.get('stype') || '');
+
   // 是否需要优选
   const [needPrefer, setNeedPrefer] = useState(
     searchParams.get('prefer') === 'true'
@@ -83,14 +84,13 @@ function PlayPageClient() {
     needPreferRef.current = needPrefer;
   }, [needPrefer]);
   // 集数相关
-  const initialIndex = parseInt(searchParams.get('index') || '1') - 1; // 转换为0基数组索引
-  const [currentEpisodeIndex, setCurrentEpisodeIndex] = useState(initialIndex);
+  const [currentEpisodeIndex, setCurrentEpisodeIndex] = useState(0);
 
   const currentSourceRef = useRef(currentSource);
   const currentIdRef = useRef(currentId);
   const videoTitleRef = useRef(videoTitle);
   const videoYearRef = useRef(videoYear);
-  const detailRef = useRef<VideoDetail | null>(detail);
+  const detailRef = useRef<SearchResult | null>(detail);
   const currentEpisodeIndexRef = useRef(currentEpisodeIndex);
 
   // 同步最新值到 refs
@@ -137,6 +137,12 @@ function PlayPageClient() {
   const [isEpisodeSelectorCollapsed, setIsEpisodeSelectorCollapsed] =
     useState(false);
 
+  // 换源加载状态
+  const [isVideoLoading, setIsVideoLoading] = useState(true);
+  const [videoLoadingStage, setVideoLoadingStage] = useState<
+    'initing' | 'sourceChanging'
+  >('initing');
+
   // 播放进度保存相关
   const saveIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const lastSaveTimeRef = useRef<number>(0);
@@ -159,7 +165,6 @@ function PlayPageClient() {
     const allResults: Array<{
       source: SearchResult;
       testResult: { quality: string; loadSpeed: string; pingTime: number };
-      score: number;
     } | null> = [];
 
     for (let start = 0; start < sources.length; start += batchSize) {
@@ -173,15 +178,15 @@ function PlayPageClient() {
               return null;
             }
 
-            const firstEpisodeUrl = source.episodes[0];
-            const testResult = await getVideoResolutionFromM3u8(
-              firstEpisodeUrl
-            );
+            const episodeUrl =
+              source.episodes.length > 1
+                ? source.episodes[1]
+                : source.episodes[0];
+            const testResult = await getVideoResolutionFromM3u8(episodeUrl);
 
             return {
               source,
               testResult,
-              score: calculateSourceScore(testResult),
             };
           } catch (error) {
             return null;
@@ -216,7 +221,6 @@ function PlayPageClient() {
     const successfulResults = allResults.filter(Boolean) as Array<{
       source: SearchResult;
       testResult: { quality: string; loadSpeed: string; pingTime: number };
-      score: number;
     }>;
 
     setPrecomputedVideoInfo(newVideoInfoMap);
@@ -226,11 +230,47 @@ function PlayPageClient() {
       return sources[0];
     }
 
+    // 找出所有有效速度的最大值，用于线性映射
+    const validSpeeds = successfulResults
+      .map((result) => {
+        const speedStr = result.testResult.loadSpeed;
+        if (speedStr === '未知' || speedStr === '测量中...') return 0;
+
+        const match = speedStr.match(/^([\d.]+)\s*(KB\/s|MB\/s)$/);
+        if (!match) return 0;
+
+        const value = parseFloat(match[1]);
+        const unit = match[2];
+        return unit === 'MB/s' ? value * 1024 : value; // 统一转换为 KB/s
+      })
+      .filter((speed) => speed > 0);
+
+    const maxSpeed = validSpeeds.length > 0 ? Math.max(...validSpeeds) : 1024; // 默认1MB/s作为基准
+
+    // 找出所有有效延迟的最小值和最大值，用于线性映射
+    const validPings = successfulResults
+      .map((result) => result.testResult.pingTime)
+      .filter((ping) => ping > 0);
+
+    const minPing = validPings.length > 0 ? Math.min(...validPings) : 50;
+    const maxPing = validPings.length > 0 ? Math.max(...validPings) : 1000;
+
+    // 计算每个结果的评分
+    const resultsWithScore = successfulResults.map((result) => ({
+      ...result,
+      score: calculateSourceScore(
+        result.testResult,
+        maxSpeed,
+        minPing,
+        maxPing
+      ),
+    }));
+
     // 按综合评分排序，选择最佳播放源
-    successfulResults.sort((a, b) => b.score - a.score);
+    resultsWithScore.sort((a, b) => b.score - a.score);
 
     console.log('播放源评分排序结果:');
-    successfulResults.forEach((result, index) => {
+    resultsWithScore.forEach((result, index) => {
       console.log(
         `${index + 1}. ${
           result.source.source_name
@@ -240,15 +280,20 @@ function PlayPageClient() {
       );
     });
 
-    return successfulResults[0].source;
+    return resultsWithScore[0].source;
   };
 
   // 计算播放源综合评分
-  const calculateSourceScore = (testResult: {
-    quality: string;
-    loadSpeed: string;
-    pingTime: number;
-  }): number => {
+  const calculateSourceScore = (
+    testResult: {
+      quality: string;
+      loadSpeed: string;
+      pingTime: number;
+    },
+    maxSpeed: number,
+    minPing: number,
+    maxPing: number
+  ): number => {
     let score = 0;
 
     // 分辨率评分 (40% 权重)
@@ -267,12 +312,12 @@ function PlayPageClient() {
         case 'SD':
           return 20;
         default:
-          return 30;
+          return 0;
       }
     })();
     score += qualityScore * 0.4;
 
-    // 下载速度评分 (40% 权重)
+    // 下载速度评分 (40% 权重) - 基于最大速度线性映射
     const speedScore = (() => {
       const speedStr = testResult.loadSpeed;
       if (speedStr === '未知' || speedStr === '测量中...') return 30;
@@ -285,25 +330,23 @@ function PlayPageClient() {
       const unit = match[2];
       const speedKBps = unit === 'MB/s' ? value * 1024 : value;
 
-      // 根据速度给分
-      if (speedKBps >= 5120) return 100; // ≥5MB/s
-      if (speedKBps >= 2048) return 85; // ≥2MB/s
-      if (speedKBps >= 1024) return 70; // ≥1MB/s
-      if (speedKBps >= 512) return 55; // ≥512KB/s
-      if (speedKBps >= 256) return 40; // ≥256KB/s
-      return 25; // <256KB/s
+      // 基于最大速度线性映射，最高100分
+      const speedRatio = speedKBps / maxSpeed;
+      return Math.min(100, Math.max(0, speedRatio * 100));
     })();
     score += speedScore * 0.4;
 
-    // 网络延迟评分 (20% 权重)
+    // 网络延迟评分 (20% 权重) - 基于延迟范围线性映射
     const pingScore = (() => {
       const ping = testResult.pingTime;
-      if (ping <= 50) return 100; // ≤50ms
-      if (ping <= 100) return 85; // ≤100ms
-      if (ping <= 200) return 70; // ≤200ms
-      if (ping <= 500) return 50; // ≤500ms
-      if (ping <= 1000) return 30; // ≤1s
-      return 15; // >1s
+      if (ping <= 0) return 0; // 无效延迟给默认分
+
+      // 如果所有延迟都相同，给满分
+      if (maxPing === minPing) return 100;
+
+      // 线性映射：最低延迟=100分，最高延迟=0分
+      const pingRatio = (maxPing - ping) / (maxPing - minPing);
+      return Math.min(100, Math.max(0, pingRatio * 100));
     })();
     score += pingScore * 0.2;
 
@@ -312,7 +355,7 @@ function PlayPageClient() {
 
   // 更新视频地址
   const updateVideoUrl = (
-    detailData: VideoDetail | null,
+    detailData: SearchResult | null,
     episodeIndex: number
   ) => {
     if (
@@ -404,96 +447,137 @@ function PlayPageClient() {
     updateVideoUrl(detail, currentEpisodeIndex);
   }, [detail, currentEpisodeIndex]);
 
-  // 获取视频详情
+  // 进入页面时直接获取全部源信息
   useEffect(() => {
-    const fetchDetailAsync = async () => {
-      console.log('fetchDetailAsync', currentSource, currentId, videoTitle);
-      if (!currentSource && !currentId && !videoTitle) {
+    const fetchSourcesData = async (query: string): Promise<SearchResult[]> => {
+      // 根据搜索词获取全部源信息
+      try {
+        const response = await fetch(
+          `/api/search?q=${encodeURIComponent(query.trim())}`
+        );
+        if (!response.ok) {
+          throw new Error('搜索失败');
+        }
+        const data = await response.json();
+
+        // 处理搜索结果，根据规则过滤
+        const results = data.results.filter(
+          (result: SearchResult) =>
+            result.title.replaceAll(' ', '').toLowerCase() ===
+              videoTitleRef.current.replaceAll(' ', '').toLowerCase() &&
+            (videoYearRef.current
+              ? result.year.toLowerCase() === videoYearRef.current.toLowerCase()
+              : true) &&
+            (searchType
+              ? (searchType === 'tv' && result.episodes.length > 1) ||
+                (searchType === 'movie' && result.episodes.length === 1)
+              : true)
+        );
+        if (results.length !== 0) {
+          setAvailableSources(results);
+          return results;
+        }
+
+        // 未获取到任何内容，fallback 使用 source + id
+        if (!currentSource || !currentId) {
+          return [];
+        }
+
+        const detailResponse = await fetch(
+          `/api/detail?source=${currentSource}&id=${currentId}`
+        );
+        if (!detailResponse.ok) {
+          throw new Error('获取视频详情失败');
+        }
+        const detailData = (await detailResponse.json()) as SearchResult;
+        results.push(detailData);
+        setAvailableSources(results);
+        return results;
+      } catch (err) {
+        setSourceSearchError(err instanceof Error ? err.message : '搜索失败');
+        setAvailableSources([]);
+        return [];
+      } finally {
+        setSourceSearchLoading(false);
+      }
+    };
+
+    const initAll = async () => {
+      if (!currentSource && !currentId && !videoTitle && !searchTitle) {
         setError('缺少必要参数');
         setLoading(false);
         return;
       }
+      setLoading(true);
+      setLoadingStage(currentSource && currentId ? 'fetching' : 'searching');
+      setLoadingMessage(
+        currentSource && currentId
+          ? '🎬 正在获取视频详情...'
+          : '🔍 正在搜索播放源...'
+      );
 
+      const sourcesInfo = await fetchSourcesData(searchTitle || videoTitle);
+      if (sourcesInfo.length === 0) {
+        setError('未找到匹配结果');
+        setLoading(false);
+        return;
+      }
+
+      let needLoadSource = currentSource;
+      let needLoadId = currentId;
       if ((!currentSource && !currentId) || needPreferRef.current) {
-        // 只包含视频标题，搜索视频
-        setLoading(true);
-        setLoadingStage('searching');
-        setLoadingMessage('🔍 正在搜索播放源...');
-
-        const searchResults = await handleSearchSources(videoTitle);
-        if (searchResults.length == 0) {
-          setError('未找到匹配结果');
-          setLoading(false);
-          return;
-        }
-        // 对播放源做优选
         setLoadingStage('preferring');
         setLoadingMessage('⚡ 正在优选最佳播放源...');
-        const preferredSource = await preferBestSource(searchResults);
+
+        const preferredSource = await preferBestSource(sourcesInfo);
         setNeedPrefer(false);
         setCurrentSource(preferredSource.source);
         setCurrentId(preferredSource.id);
         setVideoYear(preferredSource.year);
-
-        // 替换URL参数
-        const newUrl = new URL(window.location.href);
-        newUrl.searchParams.set('source', preferredSource.source);
-        newUrl.searchParams.set('id', preferredSource.id);
-        newUrl.searchParams.set('year', preferredSource.year);
-        newUrl.searchParams.delete('prefer');
-        window.history.replaceState({}, '', newUrl.toString());
-        return;
+        needLoadSource = preferredSource.source;
+        needLoadId = preferredSource.id;
       }
 
-      const fetchDetail = async () => {
-        try {
-          setLoadingStage('fetching');
-          setLoadingMessage('🎬 正在获取视频详情...');
+      console.log(sourcesInfo);
+      console.log(needLoadSource, needLoadId);
+      const detailData = sourcesInfo.find(
+        (source) =>
+          source.source === needLoadSource &&
+          source.id.toString() === needLoadId.toString()
+      );
+      if (!detailData) {
+        setError('未找到匹配结果');
+        setLoading(false);
+        return;
+      }
+      setVideoTitle(detailData.title || videoTitleRef.current);
+      setVideoYear(detailData.year);
+      setVideoCover(detailData.poster);
+      setDetail(detailData);
+      if (currentEpisodeIndex >= detailData.episodes.length) {
+        setCurrentEpisodeIndex(0);
+      }
 
-          const detailData = await fetchVideoDetail({
-            source: currentSource,
-            id: currentId,
-            fallbackTitle: videoTitleRef.current.trim(),
-            fallbackYear: videoYearRef.current,
-          });
+      // 规范URL参数
+      const newUrl = new URL(window.location.href);
+      newUrl.searchParams.set('source', needLoadSource);
+      newUrl.searchParams.set('id', needLoadId);
+      newUrl.searchParams.set('year', detailData.year);
+      newUrl.searchParams.set('title', detailData.title);
+      newUrl.searchParams.delete('prefer');
+      window.history.replaceState({}, '', newUrl.toString());
 
-          // 更新状态保存详情
-          setVideoTitle(detailData.title || videoTitleRef.current);
-          setVideoCover(detailData.poster);
-          setDetail(detailData);
+      setLoadingStage('ready');
+      setLoadingMessage('✨ 准备就绪，即将开始播放...');
 
-          // 确保集数索引在有效范围内
-          if (currentEpisodeIndex >= detailData.episodes.length) {
-            setCurrentEpisodeIndex(0);
-          }
-
-          // 清理URL参数（移除index参数）
-          if (searchParams.has('index')) {
-            const newUrl = new URL(window.location.href);
-            newUrl.searchParams.delete('index');
-            newUrl.searchParams.delete('position');
-            window.history.replaceState({}, '', newUrl.toString());
-          }
-
-          setLoadingStage('ready');
-          setLoadingMessage('✨ 准备就绪，即将开始播放...');
-
-          // 短暂延迟让用户看到完成状态
-          setTimeout(() => {
-            setLoading(false);
-          }, 1000);
-        } catch (err) {
-          console.error('获取视频详情失败:', err);
-          setError(err instanceof Error ? err.message : '获取视频详情失败');
-          setLoading(false);
-        }
-      };
-
-      fetchDetail();
+      // 短暂延迟让用户看到完成状态
+      setTimeout(() => {
+        setLoading(false);
+      }, 1000);
     };
 
-    fetchDetailAsync();
-  }, [currentSource, currentId]);
+    initAll();
+  }, []);
 
   // 播放记录处理
   useEffect(() => {
@@ -506,33 +590,7 @@ function PlayPageClient() {
         const key = generateStorageKey(currentSource, currentId);
         const record = allRecords[key];
 
-        // URL 参数
-        const urlIndexParam = searchParams.get('index');
-        const urlPositionParam = searchParams.get('position');
-
-        // 当index参数存在时的处理逻辑
-        if (urlIndexParam) {
-          const urlIndex = parseInt(urlIndexParam, 10) - 1;
-          let targetTime = 0; // 默认从0开始
-
-          // 只有index参数和position参数都存在时才生效position
-          if (urlPositionParam) {
-            targetTime = parseInt(urlPositionParam, 10);
-          } else if (record && urlIndex === record.index - 1) {
-            // 如果有同集播放记录则跳转到播放记录处
-            targetTime = record.play_time;
-          }
-          // 否则从0开始（targetTime已经是0）
-
-          // 更新当前选集索引
-          if (urlIndex !== currentEpisodeIndex) {
-            setCurrentEpisodeIndex(urlIndex);
-          }
-
-          // 保存待恢复的播放进度，待播放器就绪后跳转
-          resumeTimeRef.current = targetTime;
-        } else if (record) {
-          // 没有index参数但有播放记录时，使用原有逻辑
+        if (record) {
           const targetIndex = record.index - 1;
           const targetTime = record.play_time;
 
@@ -552,80 +610,6 @@ function PlayPageClient() {
     initFromHistory();
   }, []);
 
-  // ---------------------------------------------------------------------------
-  // 换源搜索与切换
-  // ---------------------------------------------------------------------------
-  // 处理换源搜索
-  const handleSearchSources = async (
-    query: string
-  ): Promise<SearchResult[]> => {
-    if (!query.trim()) {
-      setAvailableSources([]);
-      return [];
-    }
-
-    setSourceSearchLoading(true);
-    setSourceSearchError(null);
-
-    try {
-      const response = await fetch(
-        `/api/search?q=${encodeURIComponent(query.trim())}`
-      );
-      if (!response.ok) {
-        throw new Error('搜索失败');
-      }
-      const data = await response.json();
-
-      // 处理搜索结果：每个数据源只展示一个，优先展示与title同名的结果
-      const processedResults: SearchResult[] = [];
-      const sourceMap = new Map<string, SearchResult[]>();
-
-      // 按数据源分组
-      data.results?.forEach((result: SearchResult) => {
-        if (!sourceMap.has(result.source)) {
-          sourceMap.set(result.source, []);
-        }
-        const list = sourceMap.get(result.source);
-        if (list) {
-          list.push(result);
-        }
-      });
-
-      // 为每个数据源选择最佳结果
-      sourceMap.forEach((results) => {
-        if (results.length === 0) return;
-
-        // 只选择和当前视频标题完全匹配的结果，如果有年份，还需要年份完全匹配
-        const exactMatchs = results.filter(
-          (result) =>
-            result.title.toLowerCase() ===
-              videoTitleRef.current.toLowerCase() &&
-            (videoYearRef.current
-              ? result.year.toLowerCase() === videoYearRef.current.toLowerCase()
-              : true) &&
-            (detailRef.current
-              ? (detailRef.current.episodes.length === 1 &&
-                  result.episodes.length === 1) ||
-                (detailRef.current.episodes.length > 1 &&
-                  result.episodes.length > 1)
-              : true)
-        );
-        if (exactMatchs.length > 0) {
-          processedResults.push(...exactMatchs);
-        }
-      });
-
-      setAvailableSources(processedResults);
-      return processedResults;
-    } catch (err) {
-      setSourceSearchError(err instanceof Error ? err.message : '搜索失败');
-      setAvailableSources([]);
-      return [];
-    } finally {
-      setSourceSearchLoading(false);
-    }
-  };
-
   // 处理换源
   const handleSourceChange = async (
     newSource: string,
@@ -633,12 +617,13 @@ function PlayPageClient() {
     newTitle: string
   ) => {
     try {
+      // 显示换源加载状态
+      setVideoLoadingStage('sourceChanging');
+      setIsVideoLoading(true);
+
       // 记录当前播放进度（仅在同一集数切换时恢复）
       const currentPlayTime = artPlayerRef.current?.currentTime || 0;
       console.log('换源前当前播放时间:', currentPlayTime);
-
-      // 显示加载状态
-      setError(null);
 
       // 清除前一个历史记录
       if (currentSourceRef.current && currentIdRef.current) {
@@ -653,13 +638,13 @@ function PlayPageClient() {
         }
       }
 
-      // 获取新源的详情
-      const newDetail = await fetchVideoDetail({
-        source: newSource,
-        id: newId,
-        fallbackTitle: newTitle.trim(),
-        fallbackYear: videoYearRef.current,
-      });
+      const newDetail = availableSources.find(
+        (source) => source.source === newSource && source.id === newId
+      );
+      if (!newDetail) {
+        setError('未找到匹配结果');
+        return;
+      }
 
       // 尝试跳转到当前正在播放的集数
       let targetIndex = currentEpisodeIndex;
@@ -670,26 +655,32 @@ function PlayPageClient() {
       }
 
       // 如果仍然是同一集数且播放进度有效，则在播放器就绪后恢复到原始进度
-      if (targetIndex === currentEpisodeIndex && currentPlayTime > 1) {
-        resumeTimeRef.current = currentPlayTime;
-      } else {
-        // 否则从头开始播放，防止影响后续选集逻辑
+      if (targetIndex !== currentEpisodeIndex) {
         resumeTimeRef.current = 0;
+      } else if (
+        (!resumeTimeRef.current || resumeTimeRef.current === 0) &&
+        currentPlayTime > 1
+      ) {
+        resumeTimeRef.current = currentPlayTime;
       }
 
       // 更新URL参数（不刷新页面）
       const newUrl = new URL(window.location.href);
       newUrl.searchParams.set('source', newSource);
       newUrl.searchParams.set('id', newId);
+      newUrl.searchParams.set('year', newDetail.year);
       window.history.replaceState({}, '', newUrl.toString());
 
       setVideoTitle(newDetail.title || newTitle);
+      setVideoYear(newDetail.year);
       setVideoCover(newDetail.poster);
       setCurrentSource(newSource);
       setCurrentId(newId);
       setDetail(newDetail);
       setCurrentEpisodeIndex(targetIndex);
     } catch (err) {
+      // 隐藏换源加载状态
+      setIsVideoLoading(false);
       setError(err instanceof Error ? err.message : '换源失败');
     }
   };
@@ -855,19 +846,21 @@ function PlayPageClient() {
       await savePlayRecord(currentSourceRef.current, currentIdRef.current, {
         title: videoTitleRef.current,
         source_name: detailRef.current?.source_name || '',
-        year: detailRef.current?.year || '',
+        year: detailRef.current?.year,
         cover: detailRef.current?.poster || '',
         index: currentEpisodeIndexRef.current + 1, // 转换为1基索引
         total_episodes: detailRef.current?.episodes.length || 1,
         play_time: Math.floor(currentTime),
         total_time: Math.floor(duration),
         save_time: Date.now(),
+        search_title: searchTitle,
       });
 
       lastSaveTimeRef.current = Date.now();
       console.log('播放进度已保存:', {
         title: videoTitleRef.current,
         episode: currentEpisodeIndexRef.current + 1,
+        year: detailRef.current?.year,
         progress: `${Math.floor(currentTime)}/${Math.floor(duration)}`,
       });
     } catch (err) {
@@ -924,6 +917,22 @@ function PlayPageClient() {
     })();
   }, [currentSource, currentId]);
 
+  // 监听收藏数据更新事件
+  useEffect(() => {
+    if (!currentSource || !currentId) return;
+
+    const unsubscribe = subscribeToDataUpdates(
+      'favoritesUpdated',
+      (favorites: Record<string, any>) => {
+        const key = generateStorageKey(currentSource, currentId);
+        const isFav = !!favorites[key];
+        setFavorited(isFav);
+      }
+    );
+
+    return unsubscribe;
+  }, [currentSource, currentId]);
+
   // 切换收藏
   const handleToggleFavorite = async () => {
     if (
@@ -941,10 +950,11 @@ function PlayPageClient() {
         {
           title: videoTitleRef.current,
           source_name: detailRef.current?.source_name || '',
-          year: detailRef.current?.year || '',
+          year: detailRef.current?.year,
           cover: detailRef.current?.poster || '',
           total_episodes: detailRef.current?.episodes.length || 1,
           save_time: Date.now(),
+          search_title: searchTitle,
         }
       );
       setFavorited(newState);
@@ -1176,8 +1186,8 @@ function PlayPageClient() {
           } catch (err) {
             console.warn('恢复播放进度失败:', err);
           }
-          resumeTimeRef.current = null;
         }
+        resumeTimeRef.current = null;
 
         setTimeout(() => {
           if (
@@ -1187,6 +1197,9 @@ function PlayPageClient() {
           }
           artPlayerRef.current.notice.show = '';
         }, 0);
+
+        // 隐藏换源加载状态
+        setIsVideoLoading(false);
       });
 
       artPlayerRef.current.on('error', (err: any) => {
@@ -1194,7 +1207,6 @@ function PlayPageClient() {
         if (artPlayerRef.current.currentTime > 0) {
           return;
         }
-        setError('视频播放失败');
       });
 
       // 监听视频播放结束事件，自动播放下一集
@@ -1210,7 +1222,10 @@ function PlayPageClient() {
 
       artPlayerRef.current.on('video:timeupdate', () => {
         const now = Date.now();
-        if (now - lastSaveTimeRef.current > 5000) {
+        if (
+          now - lastSaveTimeRef.current >
+          (process.env.NEXT_PUBLIC_STORAGE_TYPE === 'd1' ? 10000 : 5000)
+        ) {
           saveCurrentPlayProgress();
           lastSaveTimeRef.current = now;
         }
@@ -1278,10 +1293,9 @@ function PlayPageClient() {
               <div className='flex justify-center space-x-2 mb-4'>
                 <div
                   className={`w-3 h-3 rounded-full transition-all duration-500 ${
-                    loadingStage === 'searching'
+                    loadingStage === 'searching' || loadingStage === 'fetching'
                       ? 'bg-green-500 scale-125'
                       : loadingStage === 'preferring' ||
-                        loadingStage === 'fetching' ||
                         loadingStage === 'ready'
                       ? 'bg-green-500'
                       : 'bg-gray-300'
@@ -1290,15 +1304,6 @@ function PlayPageClient() {
                 <div
                   className={`w-3 h-3 rounded-full transition-all duration-500 ${
                     loadingStage === 'preferring'
-                      ? 'bg-green-500 scale-125'
-                      : loadingStage === 'fetching' || loadingStage === 'ready'
-                      ? 'bg-green-500'
-                      : 'bg-gray-300'
-                  }`}
-                ></div>
-                <div
-                  className={`w-3 h-3 rounded-full transition-all duration-500 ${
-                    loadingStage === 'fetching'
                       ? 'bg-green-500 scale-125'
                       : loadingStage === 'ready'
                       ? 'bg-green-500'
@@ -1320,12 +1325,11 @@ function PlayPageClient() {
                   className='h-full bg-gradient-to-r from-green-500 to-emerald-600 rounded-full transition-all duration-1000 ease-out'
                   style={{
                     width:
-                      loadingStage === 'searching'
-                        ? '25%'
+                      loadingStage === 'searching' ||
+                      loadingStage === 'fetching'
+                        ? '33%'
                         : loadingStage === 'preferring'
-                        ? '50%'
-                        : loadingStage === 'fetching'
-                        ? '75%'
+                        ? '66%'
                         : '100%',
                   }}
                 ></div>
@@ -1478,14 +1482,54 @@ function PlayPageClient() {
           >
             {/* 播放器 */}
             <div
-              className={`h-full transition-all duration-300 ease-in-out ${
+              className={`h-full transition-all duration-300 ease-in-out rounded-xl border border-white/0 dark:border-white/30 ${
                 isEpisodeSelectorCollapsed ? 'col-span-1' : 'md:col-span-3'
               }`}
             >
-              <div
-                ref={artRef}
-                className='bg-black w-full h-[300px] lg:h-full rounded-xl overflow-hidden border border-white/0 dark:border-white/30 shadow-lg'
-              ></div>
+              <div className='relative w-full h-[300px] lg:h-full'>
+                <div
+                  ref={artRef}
+                  className='bg-black w-full h-full rounded-xl overflow-hidden shadow-lg'
+                ></div>
+
+                {/* 换源加载蒙层 */}
+                {isVideoLoading && (
+                  <div className='absolute inset-0 bg-black/85 backdrop-blur-sm rounded-xl flex items-center justify-center z-[9999] transition-all duration-300'>
+                    <div className='text-center max-w-md mx-auto px-6'>
+                      {/* 动画影院图标 */}
+                      <div className='relative mb-8'>
+                        <div className='relative mx-auto w-24 h-24 bg-gradient-to-r from-green-500 to-emerald-600 rounded-2xl shadow-2xl flex items-center justify-center transform hover:scale-105 transition-transform duration-300'>
+                          <div className='text-white text-4xl'>🎬</div>
+                          {/* 旋转光环 */}
+                          <div className='absolute -inset-2 bg-gradient-to-r from-green-500 to-emerald-600 rounded-2xl opacity-20 animate-spin'></div>
+                        </div>
+
+                        {/* 浮动粒子效果 */}
+                        <div className='absolute top-0 left-0 w-full h-full pointer-events-none'>
+                          <div className='absolute top-2 left-2 w-2 h-2 bg-green-400 rounded-full animate-bounce'></div>
+                          <div
+                            className='absolute top-4 right-4 w-1.5 h-1.5 bg-emerald-400 rounded-full animate-bounce'
+                            style={{ animationDelay: '0.5s' }}
+                          ></div>
+                          <div
+                            className='absolute bottom-3 left-6 w-1 h-1 bg-lime-400 rounded-full animate-bounce'
+                            style={{ animationDelay: '1s' }}
+                          ></div>
+                        </div>
+                      </div>
+
+                      {/* 换源消息 */}
+                      <div className='space-y-2'>
+                        <p className='text-xl font-semibold text-white animate-pulse'>
+                          {videoLoadingStage === 'sourceChanging'
+                            ? '🔄 切换播放源...'
+                            : '🔄 视频加载中...'}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* 选集和换源 - 在移动端始终显示，在 lg 及以上可折叠 */}
@@ -1503,9 +1547,8 @@ function PlayPageClient() {
                 onSourceChange={handleSourceChange}
                 currentSource={currentSource}
                 currentId={currentId}
-                videoTitle={videoTitle}
+                videoTitle={searchTitle || videoTitle}
                 availableSources={availableSources}
-                onSearchSources={handleSearchSources}
                 sourceSearchLoading={sourceSearchLoading}
                 sourceSearchError={sourceSearchError}
                 precomputedVideoInfo={precomputedVideoInfo}
@@ -1565,10 +1608,10 @@ function PlayPageClient() {
           {/* 封面展示 */}
           <div className='hidden md:block md:col-span-1 md:order-first'>
             <div className='pl-0 py-4 pr-6'>
-              <div className='bg-gray-300 dark:bg-gray-700 aspect-[3/4] flex items-center justify-center rounded-xl overflow-hidden'>
+              <div className='bg-gray-300 dark:bg-gray-700 aspect-[2/3] flex items-center justify-center rounded-xl overflow-hidden'>
                 {videoCover ? (
                   <img
-                    src={videoCover}
+                    src={processImageUrl(videoCover)}
                     alt={videoTitle}
                     className='w-full h-full object-cover'
                   />
