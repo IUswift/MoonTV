@@ -76,6 +76,20 @@
     "ikun": {
       "api": "https://ikunzyapi.com/api.php/provide/vod",
       "name": "iKun资源"
+          },
+    "wwzy": {
+      "api": "http://yys.gangko.cn/api.php/provide/vod",
+      "name": "小猫咪"
+    },
+       },
+    "ikun": {
+      "api": "https://ikunzyapi.com/api.php/provide/vod",
+      "name": "iKun资源"
+          },
+    "wwzy": {
+      "api": "https://www.69mu.cn/api.php/provide/vod",
+      "name": "舒渡"
+    },
     }
   }
 }
